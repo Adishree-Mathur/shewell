@@ -5,14 +5,20 @@ import os
 from datetime import datetime
 from twilio.rest import Client
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from deep_translator import GoogleTranslator
 import random
 from flask_migrate import Migrate
 from models import Doctor
+from typing import Any
 
 
 load_dotenv()
+
+gemini_api_key = os.getenv('GEMINI_API_KEY')
+requested_gemini_model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+genai_client = None
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or 'development-key'
@@ -29,16 +35,6 @@ else:
     twilio_client = None
     twilio_phone_number = None
 
-genai.configure(api_key='your_api_key_here')  # Replace with your API key
-
-generation_config = {
-    "temperature": 0.2,
-    "top_p": 0.95,
-    "top_k": 64,
-    "max_output_tokens": 65536,
-    "response_mime_type": "text/plain",
-}
-
 system_instruction = """
     You are a supportive AI assistant for pregnant women on the SheWell platform. Provide helpful, accurate information about pregnancy, but always recommend consulting with their doctor.
 
@@ -46,11 +42,27 @@ system_instruction = """
 -Don't give inaccurate answers, you may skip if you are unsure
 """
 
-gemini_model = genai.GenerativeModel(
-    model_name='gemini-2.0-flash',
-    generation_config=generation_config,
-    system_instruction=system_instruction
-)
+generation_config: types.GenerateContentConfigDict = {
+    "system_instruction": system_instruction,
+    "temperature": 0.2,
+    "top_p": 0.95,
+    "top_k": 64,
+    "max_output_tokens": 65536,
+    "response_mime_type": "text/plain",
+}
+
+if gemini_api_key:
+    genai_client = genai.Client(api_key=gemini_api_key)
+else:
+    app.logger.warning('GEMINI_API_KEY is not set; chatbot API will be disabled.')
+
+gemini_model_name = requested_gemini_model
+if gemini_model_name.endswith('-live'):
+    app.logger.warning(
+        'GEMINI_MODEL=%s is a Live model, but /api/chat uses generateContent; falling back to gemini-2.5-flash.',
+        gemini_model_name,
+    )
+    gemini_model_name = os.getenv('GEMINI_CHAT_MODEL', 'gemini-2.5-flash')
 
 def login_required(user_type=None):
     if 'user_id' not in session:
@@ -120,7 +132,10 @@ def register_patient():
         flash('Email is already registered', 'error')
         return redirect(url_for('register'))
 
-    new_user = User(name=name, email=email, phone=phone)
+    new_user = User()
+    new_user.name = name
+    new_user.email = email
+    new_user.phone = phone
     new_user.set_password(password)
     db.session.add(new_user)
     db.session.commit()
@@ -141,15 +156,14 @@ def register_doctor():
         flash('Email is already registered', 'error')
         return redirect(url_for('register'))
 
-    new_doctor = Doctor(
-        name=name,
-        email=email,
-        phone=phone,
-        specialization=specialization,
-        experience=request.form.get('experience', 0, type=int),
-        available_days=request.form.get('available_days', 'Mon-Fri'),
-        per_minute_price=per_minute_price
-    )
+    new_doctor = Doctor()
+    new_doctor.name = name
+    new_doctor.email = email
+    new_doctor.phone = phone
+    new_doctor.specialization = specialization
+    new_doctor.experience = request.form.get('experience', 0, type=int)
+    new_doctor.available_days = request.form.get('available_days', 'Mon-Fri')
+    new_doctor.per_minute_price = per_minute_price
     new_doctor.set_password(password)
     db.session.add(new_doctor)
     db.session.commit()
@@ -178,6 +192,10 @@ def patient_dashboard():
         return redirect_result
 
     user = User.query.get(session['user_id'])
+    if not user:
+        flash('Patient profile not found', 'error')
+        return redirect(url_for('login'))
+
     appointments = Appointment.query.filter_by(user_id=user.id).all()
     return render_template('patient_dashboard.html', user=user, appointments=appointments)
 
@@ -242,25 +260,29 @@ def book_appointment(doctor_id):
         date = request.form.get('date')
         time = request.form.get('time')
 
-        appointment = Appointment(
-            user_id=session['user_id'],
-            doctor_id=doctor_id,
-            date=datetime.strptime(date, '%Y-%m-%d'),
-            time=time
-        )
+        if not date or not time:
+            flash('Please provide both date and time', 'error')
+            return redirect(url_for('book_appointment', doctor_id=doctor_id))
+
+        appointment = Appointment()
+        appointment.user_id = session['user_id']
+        appointment.doctor_id = doctor_id
+        appointment.date = datetime.strptime(date, '%Y-%m-%d')
+        appointment.time = time
         db.session.add(appointment)
         db.session.commit()
 
         if twilio_client and twilio_phone_number:
             user = User.query.get(session['user_id'])
-            try:
-                twilio_client.messages.create(
-                    body=f"Hello {user.name}, your appointment with Dr. {doctor.name} is confirmed for {date} at {time}.",
-                    from_=twilio_phone_number,
-                    to=user.phone
-                )
-            except Exception as e:
-                app.logger.error(f"Failed to send SMS: {e}")
+            if user:
+                try:
+                    twilio_client.messages.create(
+                        body=f"Hello {user.name}, your appointment with Dr. {doctor.name} is confirmed for {date} at {time}.",
+                        from_=twilio_phone_number,
+                        to=user.phone
+                    )
+                except Exception as e:
+                    app.logger.error(f"Failed to send SMS: {e}")
 
         flash('Appointment booked successfully!', 'success')
         return redirect(url_for('dashboard'))
@@ -272,6 +294,9 @@ def chatbot():
     redirect_result = login_required('patient')
     if redirect_result:
         return redirect_result
+    if not genai_client:
+        flash('Chatbot is unavailable until GEMINI_API_KEY is configured.', 'error')
+        return redirect(url_for('home'))
     return render_template('chatbot.html')
 
 @app.route('/api/chat', methods=['POST'])
@@ -295,10 +320,22 @@ def chat():
             return text
 
     try:
-        response = gemini_model.generate_content(translate_text(user_message, 'en'))
-        ai_response = response.text.strip() if hasattr(response, 'text') else "I'm sorry, I couldn't process your request."
+        if not genai_client:
+            return jsonify({'response': 'Chatbot is unavailable until GEMINI_API_KEY is configured.'}), 503
+
+        response = genai_client.models.generate_content(
+            model=gemini_model_name,
+            contents=translate_text(user_message, 'en'),
+            config=generation_config,
+        )
+        response_text = getattr(response, 'text', None)
+        ai_response = response_text.strip() if isinstance(response_text, str) and response_text else "I'm sorry, I couldn't process your request."
         return jsonify({'response': translate_text(ai_response, selected_language)})
     except Exception as e:
+        error_message = str(e)
+        if 'quota' in error_message.lower() or '429' in error_message:
+            app.logger.error(f"Gemini quota exceeded: {e}")
+            return jsonify({'response': 'The chatbot is temporarily unavailable because the Gemini quota has been exceeded.'}), 503
         app.logger.error(f"Failed to generate AI response: {e}")
         return jsonify({'response': 'Sorry, I was unable to process your request. Please try again later.'}), 500
 
@@ -318,11 +355,14 @@ def add_doctor():
             flash('Email already registered', 'error')
             return render_template('admin_add_doctor.html')
 
-        doctor = Doctor(
-            name=name, email=email, specialization=specialization,
-            experience=experience, phone=phone,
-            available_days=available_days, per_minute_price=per_minute_price
-        )
+        doctor = Doctor()
+        doctor.name = name
+        doctor.email = email
+        doctor.specialization = specialization
+        doctor.experience = experience
+        doctor.phone = phone
+        doctor.available_days = available_days
+        doctor.per_minute_price = per_minute_price
         doctor.set_password(password)
         db.session.add(doctor)
         db.session.commit()
