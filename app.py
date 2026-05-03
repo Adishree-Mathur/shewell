@@ -1,5 +1,4 @@
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, session
-from models import db, User, Doctor, Appointment
 from werkzeug.security import generate_password_hash, check_password_hash
 import os
 from datetime import datetime
@@ -8,25 +7,89 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from deep_translator import GoogleTranslator
+from supabase import create_client
 import random
-from flask_migrate import Migrate
-from models import Doctor
-from typing import Any
+from pathlib import Path
+from postgrest.exceptions import APIError
 
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).with_name('.env'))
 
 gemini_api_key = os.getenv('GEMINI_API_KEY')
 requested_gemini_model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
 genai_client = None
+supabase_client = None
+
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or 'development-key'
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///shewell.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-db.init_app(app)
-migrate = Migrate(app, db)
+supabase_url = os.getenv('SUPABASE_URL')
+supabase_key = os.getenv('SUPABASE_KEY')
+if supabase_url and supabase_key:
+    supabase_client = create_client(supabase_url, supabase_key)
+else:
+    app.logger.warning('SUPABASE_URL or SUPABASE_KEY is not set; Supabase client is disabled.')
+
+
+def require_supabase_client():
+    if not supabase_client:
+        raise RuntimeError('Supabase client is not configured.')
+    return supabase_client
+
+
+def supabase_select_one(table_name, **filters):
+    try:
+        query = require_supabase_client().table(table_name).select('*')
+        for column, value in filters.items():
+            query = query.eq(column, value)
+        response = query.limit(1).execute()
+        rows = getattr(response, 'data', None) or []
+        return rows[0] if rows else None
+    except APIError as exc:
+        app.logger.error('Supabase select failed for %s: %s', table_name, exc)
+        raise
+
+
+def supabase_select_many(table_name, **filters):
+    try:
+        query = require_supabase_client().table(table_name).select('*')
+        for column, value in filters.items():
+            query = query.eq(column, value)
+        response = query.execute()
+        return getattr(response, 'data', None) or []
+    except APIError as exc:
+        app.logger.error('Supabase select failed for %s: %s', table_name, exc)
+        raise
+
+
+def supabase_insert(table_name, payload):
+    try:
+        response = require_supabase_client().table(table_name).insert(payload).execute()
+        rows = getattr(response, 'data', None) or []
+        return rows[0] if rows else None
+    except APIError as exc:
+        app.logger.error('Supabase insert failed for %s: %s', table_name, exc)
+        raise
+
+
+def supabase_update(table_name, payload, **filters):
+    try:
+        query = require_supabase_client().table(table_name).update(payload)
+        for column, value in filters.items():
+            query = query.eq(column, value)
+        response = query.execute()
+        return getattr(response, 'data', None) or []
+    except APIError as exc:
+        app.logger.error('Supabase update failed for %s: %s', table_name, exc)
+        raise
+
+
+@app.errorhandler(APIError)
+def handle_supabase_api_error(exc):
+    message = getattr(exc, 'message', None) or str(exc)
+    flash(f'Database error: {message}', 'error')
+    return redirect(request.referrer or url_for('home'))
 
 if os.getenv('TWILIO_ACCOUNT_SID') and os.getenv('TWILIO_AUTH_TOKEN'):
     twilio_client = Client(os.getenv('TWILIO_ACCOUNT_SID'), os.getenv('TWILIO_AUTH_TOKEN'))
@@ -84,12 +147,13 @@ def login():
         password = request.form.get('password')
         user_type = request.form.get('user_type')
 
-        user = User.query.filter_by(email=email).first() if user_type == 'patient' else Doctor.query.filter_by(email=email).first()
-        
-        if user and user.check_password(password):
-            session['user_id'] = user.id
+        table_name = 'user' if user_type == 'patient' else 'doctor'
+        user = supabase_select_one(table_name, email=email)
+
+        if user and check_password_hash(user.get('password_hash', ''), password):
+            session['user_id'] = user['id']
             session['user_type'] = user_type
-            session['name'] = user.name  # Store name in session
+            session['name'] = user['name']
             flash('Login successful!', 'success')
             return redirect(url_for('dashboard'))
 
@@ -128,17 +192,17 @@ def register_patient():
     phone = request.form.get('phone')
     password = request.form.get('password')
 
-    if User.query.filter_by(email=email).first():
+    if supabase_select_one('user', email=email):
         flash('Email is already registered', 'error')
         return redirect(url_for('register'))
 
-    new_user = User()
-    new_user.name = name
-    new_user.email = email
-    new_user.phone = phone
-    new_user.set_password(password)
-    db.session.add(new_user)
-    db.session.commit()
+    supabase_insert('user', {
+        'name': name,
+        'email': email,
+        'phone': phone,
+        'password_hash': generate_password_hash(password),
+        'due_date': None,
+    })
 
     flash('Patient registered successfully! Please log in.', 'success')
     return redirect(url_for('login'))
@@ -152,21 +216,20 @@ def register_doctor():
     password = request.form.get('password')
     per_minute_price = request.form.get('per_minute_price', type=float)
 
-    if Doctor.query.filter_by(email=email).first():
+    if supabase_select_one('doctor', email=email):
         flash('Email is already registered', 'error')
         return redirect(url_for('register'))
 
-    new_doctor = Doctor()
-    new_doctor.name = name
-    new_doctor.email = email
-    new_doctor.phone = phone
-    new_doctor.specialization = specialization
-    new_doctor.experience = request.form.get('experience', 0, type=int)
-    new_doctor.available_days = request.form.get('available_days', 'Mon-Fri')
-    new_doctor.per_minute_price = per_minute_price
-    new_doctor.set_password(password)
-    db.session.add(new_doctor)
-    db.session.commit()
+    supabase_insert('doctor', {
+        'name': name,
+        'email': email,
+        'phone': phone,
+        'specialization': specialization,
+        'experience': request.form.get('experience', 0, type=int),
+        'available_days': request.form.get('available_days', 'Mon-Fri'),
+        'per_minute_price': per_minute_price,
+        'password_hash': generate_password_hash(password),
+    })
 
     flash('Doctor registered successfully! Please log in.', 'success')
     return redirect(url_for('login'))
@@ -191,12 +254,12 @@ def patient_dashboard():
     if redirect_result:
         return redirect_result
 
-    user = User.query.get(session['user_id'])
+    user = supabase_select_one('user', id=session['user_id'])
     if not user:
         flash('Patient profile not found', 'error')
         return redirect(url_for('login'))
 
-    appointments = Appointment.query.filter_by(user_id=user.id).all()
+    appointments = supabase_select_many('appointment', user_id=user['id'])
     return render_template('patient_dashboard.html', user=user, appointments=appointments)
 
 @app.route('/doctor_dashboard', methods=['GET', 'POST'])
@@ -208,7 +271,7 @@ def doctor_dashboard():
             return redirect(url_for('login'))
 
         # Get doctor from database
-        doctor = Doctor.query.get(session['user_id'])
+        doctor = supabase_select_one('doctor', id=session['user_id'])
         if not doctor:
             flash('Doctor profile not found', 'error')
             return redirect(url_for('login'))
@@ -217,12 +280,12 @@ def doctor_dashboard():
         if request.method == 'POST':
             new_price = request.form.get('per_minute_price', type=float)
             if new_price is not None:
-                doctor.per_minute_price = new_price
-                db.session.commit()
+                supabase_update('doctor', {'per_minute_price': new_price}, id=doctor['id'])
+                doctor['per_minute_price'] = new_price
                 flash('Price updated successfully!', 'success')
 
         # Get appointments
-        appointments = Appointment.query.filter_by(doctor_id=doctor.id).all()
+        appointments = supabase_select_many('appointment', doctor_id=doctor['id'])
         
         # Render template with all required variables
         return render_template('doctor_dashboard.html',
@@ -245,7 +308,7 @@ def doctors():
     redirect_result = login_required('patient')
     if redirect_result:
         return redirect_result
-    doctors_list = Doctor.query.all()
+    doctors_list = supabase_select_many('doctor')
     return render_template('doctors.html', doctors=doctors_list)
 
 @app.route('/book_appointment/<int:doctor_id>', methods=['GET', 'POST'])
@@ -254,7 +317,10 @@ def book_appointment(doctor_id):
     if redirect_result:
         return redirect_result
 
-    doctor = Doctor.query.get_or_404(doctor_id)
+    doctor = supabase_select_one('doctor', id=doctor_id)
+    if not doctor:
+        flash('Doctor profile not found', 'error')
+        return redirect(url_for('doctors'))
 
     if request.method == 'POST':
         date = request.form.get('date')
@@ -264,22 +330,22 @@ def book_appointment(doctor_id):
             flash('Please provide both date and time', 'error')
             return redirect(url_for('book_appointment', doctor_id=doctor_id))
 
-        appointment = Appointment()
-        appointment.user_id = session['user_id']
-        appointment.doctor_id = doctor_id
-        appointment.date = datetime.strptime(date, '%Y-%m-%d')
-        appointment.time = time
-        db.session.add(appointment)
-        db.session.commit()
+        supabase_insert('appointment', {
+            'user_id': session['user_id'],
+            'doctor_id': doctor_id,
+            'date': date,
+            'time': time,
+            'status': 'scheduled',
+        })
 
         if twilio_client and twilio_phone_number:
-            user = User.query.get(session['user_id'])
+            user = supabase_select_one('user', id=session['user_id'])
             if user:
                 try:
                     twilio_client.messages.create(
-                        body=f"Hello {user.name}, your appointment with Dr. {doctor.name} is confirmed for {date} at {time}.",
+                        body=f"Hello {user['name']}, your appointment with Dr. {doctor['name']} is confirmed for {date} at {time}.",
                         from_=twilio_phone_number,
-                        to=user.phone
+                        to=user['phone']
                     )
                 except Exception as e:
                     app.logger.error(f"Failed to send SMS: {e}")
@@ -351,27 +417,24 @@ def add_doctor():
         available_days = request.form.get('available_days')
         per_minute_price = request.form.get('per_minute_price', type=float)
 
-        if Doctor.query.filter_by(email=email).first():
+        if supabase_select_one('doctor', email=email):
             flash('Email already registered', 'error')
             return render_template('admin_add_doctor.html')
 
-        doctor = Doctor()
-        doctor.name = name
-        doctor.email = email
-        doctor.specialization = specialization
-        doctor.experience = experience
-        doctor.phone = phone
-        doctor.available_days = available_days
-        doctor.per_minute_price = per_minute_price
-        doctor.set_password(password)
-        db.session.add(doctor)
-        db.session.commit()
+        supabase_insert('doctor', {
+            'name': name,
+            'email': email,
+            'specialization': specialization,
+            'experience': experience,
+            'phone': phone,
+            'available_days': available_days,
+            'per_minute_price': per_minute_price,
+            'password_hash': generate_password_hash(password),
+        })
         flash('Doctor added successfully!', 'success')
         return redirect(url_for('home'))
 
     return render_template('admin_add_doctor.html')
 
 if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
     app.run(debug=True)
